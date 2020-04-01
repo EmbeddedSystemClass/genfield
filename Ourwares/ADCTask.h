@@ -1,28 +1,49 @@
 /******************************************************************************
-* File Name          : ADCTask.h
+* File Name          : adctask.h
 * Date First Issued  : 02/01/2019
-* Description        : ADC w DMA using FreeRTOS/ST HAL
+* Description        : Handle ADC w DMA using FreeRTOS/ST HAL within a task
 *******************************************************************************/
 
-#ifndef __ADCTASK
-#define __ADCTASK
+#ifndef __ADCTASKLC
+#define __ADCTASKLC
 
 #include "FreeRTOS.h"
 #include "task.h"
 #include "cmsis_os.h"
 #include "stm32f1xx_hal.h"
 
-/* WARNING: if not 16 adcfastsums needs to be changed. */
-#define ADCSEQNUM 16  // Number of ADC scans in 1/2 of the DMA buffer
+#define ADCNUM 2  // Number of ADC modules
+
+/* Augment 'MX adc control block for dma buffering and summing */
+struct ADCDMATSKBLK
+{
+	struct ADCDMATSKBLK* pnext;
+	ADC_HandleTypeDef* phadc; // Pointer to 'MX adc control block
+	uint32_t  notebit1; // Notification bit for dma half complete interrupt
+	uint32_t  notebit2; // Notification bit for dma complete interrupt
+	uint32_t* pnoteval; // Pointer to notification word
+	uint16_t* pdma1;    // Pointer to first half of dma buffer
+	uint16_t* pdma2;    // Pointer to second half of dma buffer
+	osThreadId adctaskHandle; // Task to notify upon DMA interrupt
+};
 
 /* *************************************************************************/
-osThreadId xADCTaskCreate(uint32_t taskpriority);
-/* @brief	: Create task; task handle created is global for all to enjoy!
- * @param	: taskpriority = Task priority (just as it says!)
- * @return	: ADCTaskHandle
+struct ADCDMATSKBLK* adctask_init(ADC_HandleTypeDef* phadc,\
+	uint32_t  notebit1,\
+	uint32_t  notebit2,\
+	uint32_t* pnoteval);
+/*	@brief	: Setup ADC DMA buffers and control block
+ * @param	: phadc = pointer to ADC control block
+ * @param	: notebit1 = unique bit for notification @ 1/2 dma buffer
+ * @param	: notebit2 = unique bit for notification @ end dma buffer
+ * @param	: pnoteval = pointer to word receiving notification word from OS
+ * @return	: NULL = fail
  * *************************************************************************/
 
-extern osThreadId ADCTaskHandle;
+extern struct ADCDMATSKBLK adc1dmatskblk[ADCNUM];
+
+/* Calibration values common to all ADC modules. */
+extern struct ADCCALCOMMON adcommon;
 
 #endif
 
