@@ -1,113 +1,155 @@
 /******************************************************************************
-* File Name          : ADCTask.c
+* File Name          : adctask.c
 * Date First Issued  : 02/01/2019
-* Description        : Processing ADC readings after ADC/DMA issues interrupt
+* Description        : Handle ADC w DMA using FreeRTOS/ST HAL within a task
 *******************************************************************************/
 
 #include "FreeRTOS.h"
-#include "task.h"
 #include "cmsis_os.h"
 #include "malloc.h"
-
-#include "ADCTask.h"
 #include "adctask.h"
-#include "morse.h"
-#include "adcfastsum16.h"
 #include "adcparams.h"
-#include "GenfieldTask.h"
-#include "adcextendsum.h"
+#include "adcfastsum16.h"
+#include "ADCTask.h"
 
-void StartADCTask(void const * argument);
-
-uint32_t adcsumdb[6]; // debug
-uint32_t adcdbctr = 0;// debug
-
-osThreadId ADCTaskHandle;
+#include "morse.h"
 
 extern ADC_HandleTypeDef hadc1;
 
-extern osThreadId GenfieldTaskHandle;
+struct ADCDMATSKBLK adc1dmatskblk[ADCNUM];
 
 /* *************************************************************************
- * osThreadId xADCTaskCreate(uint32_t taskpriority);
- * @brief	: Create task; task handle created is global for all to enjoy!
- * @param	: taskpriority = Task priority (just as it says!)
- * @return	: ADCTaskHandle
+ * struct ADCDMATSKBLK* adctask_init(ADC_HandleTypeDef* phadc,\
+	 uint32_t  notebit1,\
+	 uint32_t  notebit2,\
+	 uint32_t* pnoteval);
+ *	@brief	: Setup ADC DMA buffers and control block
+ * @param	: phadc = pointer to 'MX ADC control block
+ * @param	: notebit1 = unique bit for notification @ 1/2 dma buffer
+ * @param	: notebit2 = unique bit for notification @ end dma buffer
+ * @param	: pnoteval = pointer to word receiving notification word from OS
+ * @return	: NULL = fail
  * *************************************************************************/
-osThreadId xADCTaskCreate(uint32_t taskpriority)
-{
- 	osThreadDef(ADCTask, StartADCTask, osPriorityNormal, 0, 128);
-	ADCTaskHandle = osThreadCreate(osThread(ADCTask), NULL);
-	vTaskPrioritySet( ADCTaskHandle, taskpriority );
-	return ADCTaskHandle;
+/*
+   notebit1 notify at the halfway dma buffer point
+     associates with pdma (beginning of dma buffer)
+   notebit2 notify at the end of the dma buffer
+     associates with pdma + dmact * phadc->Init.NbrOfConversion
+*/
 
+struct ADCDMATSKBLK* adctask_init(ADC_HandleTypeDef* phadc,\
+	uint32_t  notebit1,\
+	uint32_t  notebit2,\
+	uint32_t* pnoteval)
+{
+	uint16_t* pdma;
+	struct ADCDMATSKBLK* pblk = &adc1dmatskblk[0]; // ADC1 only for now
+
+	/* 'adcparams.h' MUST match what STM32CubeMX set up. */
+	if (ADC1IDX_ADCSCANSIZE != phadc->Init.NbrOfConversion) morse_trap(61);//return NULL;
+
+	/* ADC DMA summation length must match 1/2 DMA buffer sizing. */
+	if (ADCFASTSUM16SIZE != ADC1DMANUMSEQ) morse_trap(62);
+
+	/* length = total number of uint16_t in dma buffer */
+	uint32_t length = ADC1DMANUMSEQ * 2 * phadc->Init.NbrOfConversion;
+
+taskENTER_CRITICAL();
+
+	/* Initialize params for ADC. */
+	adcparams_init();
+
+	/* Get dma buffer allocated */
+	pdma = (uint16_t*)calloc(length, sizeof(uint16_t));
+	if (pdma == NULL) {taskEXIT_CRITICAL();morse_trap(63);}
+
+	/* Populate our control block */
+/* The following reproduced for convenience--
+struct ADCDMATSKBLK
+{
+	struct ADCDMATSKBLK* pnext;
+	ADC_HandleTypeDef* phadc; // Pointer to 'MX adc control block
+	uint32_t  notebit1; // Notification bit for dma half complete interrupt
+	uint32_t  notebit2; // Notification bit for dma complete interrupt
+	uint32_t* pnoteval; // Pointer to notification word
+	uint16_t* pdma1;    // Pointer to first half of dma buffer
+	uint16_t* pdma2;    // Pointer to second half of dma buffer
+	osThreadId adctaskHandle;
+	uint32_t* psum;     // Pointer summed 1/2 dma buffer
+	uint16_t  dmact;    // Number of sequences in 1/2 dma buffer
+};
+
+*/
+	pblk->phadc    = phadc;
+	pblk->notebit1 = notebit1;
+	pblk->notebit2 = notebit2;
+	pblk->pnoteval = pnoteval;
+	pblk->pdma1    = pdma;
+	pblk->pdma2    = pdma + (ADC1DMANUMSEQ * phadc->Init.NbrOfConversion);
+	pblk->adctaskHandle = ADCTaskHandle;
+
+/**
+  * @brief  Enables ADC DMA request after last transfer (Single-ADC mode) and enables ADC peripheral  
+  * @param  hadc pointer to a ADC_HandleTypeDef structure that contains
+  *         the configuration information for the specified ADC.
+  * @param  pData The destination Buffer address.
+  * @param  Length The length of data to be transferred from ADC peripheral to memory.
+  * @retval HAL status
+  */
+
+taskEXIT_CRITICAL();
+	
+	HAL_ADCEx_Calibration_Start(phadc);
+
+	HAL_ADC_Start_DMA(pblk->phadc, (uint32_t*)pblk->pdma1, length);
+	return pblk;
+}
+
+/* #######################################################################
+   ADC DMA interrupt callbacks
+   ####################################################################### */
+/* *************************************************************************
+ * void HAL_ADC_ConvHalfCpltCallback(ADC_HandleTypeDef* hadc);
+ *	@brief	: Call back from stm32f4xx_hal_adc: Halfway point of dma buffer
+ * *************************************************************************/
+/* *************************************************************************
+ * void HAL_ADC_ConvHalfCpltCallback(ADC_HandleTypeDef* hadc);
+ *	@brief	: Call back from stm32f4xx_hal_adc: Halfway point of dma buffer
+ * *************************************************************************/
+void HAL_ADC_ConvHalfCpltCallback(ADC_HandleTypeDef* hadc)
+{
+//	adcommon.dmact += 1; // Running count
+	BaseType_t xHigherPriorityTaskWoken = pdFALSE;
+	struct ADCDMATSKBLK* ptmp = &adc1dmatskblk[0];
+
+	/* Trigger Recieve Task to poll dma uarts */
+	if( ptmp->adctaskHandle == NULL) return; // Skip task has not been created
+	xTaskNotifyFromISR(ptmp->adctaskHandle, 
+		ptmp->notebit1,	/* 'or' bit assigned to buffer to notification value. */
+		eSetBits,      /* Set 'or' option */
+		&xHigherPriorityTaskWoken ); 
+
+	portYIELD_FROM_ISR( xHigherPriorityTaskWoken );
+	return;
 }
 /* *************************************************************************
- * void StartADCTask(void const * argument);
- *	@brief	: Task startup
+ * void HAL_ADC_ConvCpltCallback(ADC_HandleTypeDef* hadc);
+ *	@brief	: Call back from stm32f4xx_hal_adc: End point of dma buffer
  * *************************************************************************/
-void StartADCTask(void const * argument)
+void HAL_ADC_ConvCpltCallback(ADC_HandleTypeDef* hadc)
 {
-	#define TSK02BIT02	(1 << 0)  // Task notification bit for ADC dma 1st 1/2 (adctask.c)
-	#define TSK02BIT03	(1 << 1)  // Task notification bit for ADC dma end (adctask.c)
+//	adcommon.dmact += 1; // Running count
+	BaseType_t xHigherPriorityTaskWoken = pdFALSE;
+	struct ADCDMATSKBLK* ptmp = &adc1dmatskblk[0];
 
-	uint16_t* pdma;
+	/* Trigger Recieve Task to poll dma uarts */
+	if( ptmp->adctaskHandle == NULL) return; // Skip task has not been created
+	xTaskNotifyFromISR(ptmp->adctaskHandle, 
+		ptmp->notebit2,	/* 'or' bit assigned to buffer to notification value. */
+		eSetBits,      /* Set 'or' option */
+		&xHigherPriorityTaskWoken ); 
 
-	/* A notification copies the internal notification word to this. */
-	uint32_t noteval = 0;    // Receives notification word upon an API notify
-
-	/* notification bits processed after a 'Wait. */
-	uint32_t noteused = 0;
-
-	/* Get buffers, "our" control block, and ==>START<== ADC/DMA running. */
-	struct ADCDMATSKBLK* pblk = adctask_init(&hadc1,TSK02BIT02,TSK02BIT03,&noteval);
-	if (pblk == NULL) {morse_trap(15);}
-
-  /* Infinite loop */
-  for(;;)
-  {
-		/* Wait for DMA interrupt notification from adctask.c */
-		xTaskNotifyWait(noteused, 0, &noteval, portMAX_DELAY);
-		noteused = 0;	// Accumulate bits in 'noteval' processed.
-
-		/* We handled one, or both, noteval bits */
-		noteused |= (pblk->notebit1 | pblk->notebit2);
-
-		if (noteval & TSK02BIT02)
-		{
-			pdma = adc1dmatskblk[0].pdma1; // [0] = adc1
-		}
-		else
-		{
-			pdma = adc1dmatskblk[0].pdma2;
-		}
-
-		/* Sum the readings 1/2 of DMA buffer to an array. */
-		adcfastsum16(&adc1.chan[0], pdma); // Fast in-line addition
-		adc1.ctr += 1; // Update count
-
-#define DEBUGGINGADCREADINGS
-#ifdef DEBUGGINGADCREADINGS
-		/* Save sum for defaultTask printout for debugging */
-		adcsumdb[0] = adc1.chan[0].sum;
-		adcsumdb[1] = adc1.chan[1].sum;
-		adcsumdb[2] = adc1.chan[2].sum;
-		adcsumdb[3] = adc1.chan[3].sum;
-		adcsumdb[4] = adc1.chan[4].sum;
-		adcsumdb[5] = adc1.chan[5].sum;
-		adcdbctr += 1;
-#endif
-
-		/* Extended sum for smoothing and display. */
-		adcextendsum(&adc1);
-
-		/* Calibrate and filter ADC readings. */
-		adcparams_cal();
-
-		/* Notify GenfieldTask that new readings are ready. */
-		if( GenfieldTaskHandle == NULL) morse_trap(51); // JIC task has not been created
-		
-		xTaskNotify(GenfieldTaskHandle, CNCTBIT00, eSetBits);
-  }
+	portYIELD_FROM_ISR( xHigherPriorityTaskWoken );
+	return;
 }
 
